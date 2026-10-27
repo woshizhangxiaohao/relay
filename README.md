@@ -10,10 +10,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/woshizhangxiaohao/relay/main/r
 |---|---|
 | 1. 初始化 | 安装 3x-ui v3.11.0 + Xray v26.6.27，建好 VLESS + Reality 入站、落地出站和转发规则，输出节点链接 |
 | 2. 更换落地 | 换 SOCKS5 / 落地机链接，或改成不需要落地；节点链接不变 |
-| 3. 切换入口类型 | 仅 IPv4 / 仅 IPv6 / 都开 |
+| 3. 开关 IPv4 / IPv6 入站 | 单独开启或关闭其中一个（面板里点开关效果相同） |
 | 4. 输出链接 | 读当前配置重新打印链接，不改任何东西（非本脚本装的 3x-ui 也能用） |
 
-也可以直接带子命令：`relay.sh init | landing | entry | links`。
+也可以直接带子命令：`relay.sh init | landing | toggle | links`。
 
 ## 默认值
 
@@ -24,6 +24,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/woshizhangxiaohao/relay/main/r
 
 ## 规则
 
+- 初始化建两个入站：IPv4、IPv6 各一个，同一端口（默认 443），各用独立的 UUID 和 Reality 密钥，互相不能关联；本机没有公网 IPv6 时只建 IPv4。两个都转发到同一个落地。
 - 出口只用 IPv4（direct 出站 `UseIPv4`），网站看到的永远是本机或落地的 IPv4。
 - 有落地时，本入站的流量全部走落地；落地不通就连不上，不会改用本机 IP 出去。
 - 「不需要落地」的机器输出的 IPv4 链接，可以直接粘贴给另一台中转机当落地。
@@ -36,5 +37,5 @@ bash <(curl -Ls https://raw.githubusercontent.com/woshizhangxiaohao/relay/main/r
 
 ## 本机文件
 
-- `/etc/x-ui/relay.env`：脚本记录的入站 ID、端口、入口类型等（不含密码）
+- `/etc/x-ui/relay.env`：脚本记录的入站 ID、端口、落地类型等（不含密码）
 - `/etc/x-ui/relay-links.txt`：最近一次输出的节点链接（仅 root 可读）

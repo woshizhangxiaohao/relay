@@ -153,13 +153,13 @@ ask_landing() {
   esac
 }
 
-# 改 Xray 模板：出口只用 IPv4；本入站全部走落地（无落地则走 direct）；落地不通不回退
+# 改 Xray 模板：出口只用 IPv4；本脚本的入站（逗号分隔的 tag）全部走落地（无落地则走 direct）；落地不通不回退
 apply_routing() {
-  local inbound_tag="$1" tpl new
+  local inbound_tags="$1" tpl new
   tpl=$(jget "$(api POST xray/)" obj.xraySetting)
-  new=$(python3 - "$tpl" "$inbound_tag" "${LANDING_JSON:-}" "$LANDING_TAG" "$RULE_TAG" <<'PY'
+  new=$(python3 - "$tpl" "$inbound_tags" "${LANDING_JSON:-}" "$LANDING_TAG" "$RULE_TAG" <<'PY'
 import json, sys
-c = json.loads(sys.argv[1]); itag, landing, ltag, rtag = sys.argv[2:6]
+c = json.loads(sys.argv[1]); itags, landing, ltag, rtag = sys.argv[2:6]
 obs = [o for o in c.get("outbounds", []) if o.get("tag") != ltag]
 direct = next((o for o in obs if o.get("protocol") == "freedom" and o.get("tag") == "direct"), None)
 if not direct:
@@ -168,7 +168,7 @@ direct.setdefault("settings", {})["domainStrategy"] = "UseIPv4"
 if landing: obs.append(json.loads(landing))
 c["outbounds"] = obs
 r = c.setdefault("routing", {}); rules = [x for x in r.get("rules", []) if x.get("ruleTag") != rtag]
-mine = {"type": "field", "ruleTag": rtag, "inboundTag": [itag], "outboundTag": ltag if landing else "direct"}
+mine = {"type": "field", "ruleTag": rtag, "inboundTag": itags.split(","), "outboundTag": ltag if landing else "direct"}
 pos = next((i + 1 for i, x in enumerate(rules) if x.get("outboundTag") == "api"), 0)
 rules.insert(pos, mine); r["rules"] = rules
 print(json.dumps(c, ensure_ascii=False, indent=2))
@@ -199,22 +199,51 @@ PY
   green "自检通过：出口 IP = $ip"
 }
 
-# ---------- 入口类型 ----------
-ask_entry() {
-  echo "入口用哪种？"
-  echo "  1. 仅 IPv4（默认）"
-  echo "  2. 仅 IPv6（IPv4 被封时用）"
-  echo "  3. 两个都开"
-  local c; ask c "请选择 [1]: " 1
-  case "$c" in 1) ENTRY=v4 ;; 2) ENTRY=v6 ;; 3) ENTRY=both ;; *) die "无效选择" ;; esac
-  if [[ $ENTRY != v4 && -z "$(local_ip6)" ]]; then die "本机没有公网 IPv6，请先在服务商面板开启 IPv6"; fi
+# ---------- 入站：IPv4、IPv6 各一个，同端口、各用独立 UUID 和密钥 ----------
+# add_inbound <v4|v6> <监听地址>，输出 "id tag"
+add_inbound() {
+  local kind="$1" listen="$2" keys priv pub uuid sid body res
+  keys=$(api GET server/getNewX25519Cert); priv=$(jget "$keys" obj.privateKey); pub=$(jget "$keys" obj.publicKey)
+  uuid=$(jget "$(api GET server/getNewUUID)" obj.uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')
+  sid=$(openssl rand -hex 8)
+  # realitySettings.settings.publicKey 不进 Xray 配置，但 3x-ui 面板导出分享链接要用它，缺了导出的链接连不上
+  body=$(python3 - "$IN_PORT" "$listen" "$uuid" "$SNI" "$priv" "$sid" "$pub" "$kind" <<'PY'
+import json, sys
+port, listen, uid, sni, priv, sid, pub, kind = sys.argv[1:9]
+print(json.dumps({"enable": True, "remark": f"relay-{kind}", "listen": listen, "port": int(port), "protocol": "vless",
+  "expiryTime": 0, "total": 0,
+  "settings": {"clients": [{"id": uid, "email": f"relay-{kind}", "flow": "xtls-rprx-vision", "enable": True}],
+               "decryption": "none", "fallbacks": []},
+  "streamSettings": {"network": "tcp", "security": "reality", "tcpSettings": {"header": {"type": "none"}},
+    "realitySettings": {"show": False, "xver": 0, "target": f"{sni}:443", "serverNames": [sni],
+                        "privateKey": priv, "shortIds": [sid],
+                        "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}}},
+  "sniffing": {"enabled": False}}))
+PY
+)
+  res=$(api POST inbounds/add -H 'Content-Type: application/json' --data "$body")
+  echo "$(jget "$res" obj.id) $(jget "$res" obj.tag)"
 }
-entry_listen() {
-  case "$ENTRY" in
-    v4) local_ip4 ;;
-    v6) local_ip6 ;;
-    both) echo "" ;;
-  esac
+
+# ---------- 3. 开关 IPv4 / IPv6 入站 ----------
+do_toggle() {
+  [[ -f "$STATE" ]] || die "这台机器不是用本脚本初始化的，请先选「初始化」"
+  api_init
+  local ids=() i=0 id ib c
+  for id in $INBOUND_IDS; do
+    ib=$(jget "$(api GET "inbounds/get/$id")" obj)
+    ids+=("$id"); i=$((i + 1))
+    echo "  $i. $(jget "$ib" remark)  监听 $(jget "$ib" listen):$(jget "$ib" port)  $([[ $(jget "$ib" enable) == True ]] && echo 已开启 || echo 已关闭)"
+  done
+  ask c "切换哪一个的开关？[1-$i]: "
+  [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le $i ]] || die "无效选择"
+  id=${ids[$((c - 1))]}
+  ib=$(jget "$(api GET "inbounds/get/$id")" obj)
+  ib=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["enable"]=not d["enable"]
+d.pop("clientStats", None); print(json.dumps(d))' "$ib")
+  api POST "inbounds/update/$id" -H 'Content-Type: application/json' --data "$ib" >/dev/null
+  restart_xray
+  echo "当前开启的节点链接："; print_links
 }
 
 # ---------- 输出链接（直接读运行中的 Xray 配置，脚本外装的 3x-ui 也能用） ----------
@@ -257,10 +286,9 @@ save_state() {
 PANEL_PORT=$PANEL_PORT
 IN_PORT=$IN_PORT
 SNI=$SNI
-ENTRY=$ENTRY
 LANDING_TYPE=$LANDING_TYPE
-INBOUND_ID=$INBOUND_ID
-INBOUND_TAG=$INBOUND_TAG
+INBOUND_IDS="$INBOUND_IDS"
+INBOUND_TAGS=$INBOUND_TAGS
 EOF
 }
 
@@ -288,7 +316,7 @@ do_init() {
   ask IN_PORT "入站端口 [443]: " 443
   ask SNI "伪装网站 [calmerry.com]: " calmerry.com
   ask_landing
-  ask_entry
+  [[ -n "$(local_ip6)" ]] || yellow "本机没有公网 IPv6，只建 IPv4 入站（要 IPv6 先去服务商面板开启，再重新初始化）"
 
   if [[ -x "$XUI_BIN" ]]; then
     yellow "本机已装 3x-ui。初始化会清空现有面板配置（节点、账号都会重建）。"
@@ -327,36 +355,23 @@ do_init() {
     local go; ask go "仍然继续？[y/N]: " n; [[ "$go" == y ]] || die "已取消，换个伪装网站再来"
   fi
 
-  local keys uuid priv pub sid body res
-  keys=$(api GET server/getNewX25519Cert); priv=$(jget "$keys" obj.privateKey); pub=$(jget "$keys" obj.publicKey)
-  uuid=$(jget "$(api GET server/getNewUUID)" obj.uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')
-  sid=$(openssl rand -hex 8)
-  # realitySettings.settings.publicKey 不进 Xray 配置，但 3x-ui 面板导出分享链接要用它，缺了导出的链接连不上
-  body=$(python3 - "$IN_PORT" "$(entry_listen)" "$uuid" "$SNI" "$priv" "$sid" "$pub" <<'PY'
-import json, sys
-port, listen, uid, sni, priv, sid, pub = sys.argv[1:8]
-print(json.dumps({"enable": True, "remark": "relay", "listen": listen, "port": int(port), "protocol": "vless",
-  "expiryTime": 0, "total": 0,
-  "settings": {"clients": [{"id": uid, "email": "relay", "flow": "xtls-rprx-vision", "enable": True}],
-               "decryption": "none", "fallbacks": []},
-  "streamSettings": {"network": "tcp", "security": "reality", "tcpSettings": {"header": {"type": "none"}},
-    "realitySettings": {"show": False, "xver": 0, "target": f"{sni}:443", "serverNames": [sni],
-                        "privateKey": priv, "shortIds": [sid],
-                        "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}}},
-  "sniffing": {"enabled": False}}))
-PY
-)
-  res=$(api POST inbounds/add -H 'Content-Type: application/json' --data "$body")
-  INBOUND_ID=$(jget "$res" obj.id); INBOUND_TAG=$(jget "$res" obj.tag)
+  local r ip6
+  r=$(add_inbound v4 "$(local_ip4)")
+  INBOUND_IDS=${r%% *}; INBOUND_TAGS=${r#* }
+  ip6=$(local_ip6)
+  if [[ -n "$ip6" ]]; then
+    r=$(add_inbound v6 "$ip6")
+    INBOUND_IDS="$INBOUND_IDS ${r%% *}"; INBOUND_TAGS="$INBOUND_TAGS,${r#* }"
+  fi
 
-  apply_routing "$INBOUND_TAG"
+  apply_routing "$INBOUND_TAGS"
   restart_xray
   open_firewall "$IN_PORT" "$PANEL_PORT"
   save_state
   self_test || yellow "（自检没过，配置已保存，可以用「更换落地」重新设置）"
   echo; show_panel
   echo "节点链接（同时保存在 $LINKS）："; print_links
-  [[ $ENTRY == both ]] && yellow "两条都导入 Shadowrocket，建「故障转移」策略组：IPv4 排第一、IPv6 排第二。"
+  [[ -n "$ip6" ]] && yellow "IPv4、IPv6 是两个独立节点（密钥不同）。都导入 Shadowrocket，可建「故障转移」策略组自动切换。"
 }
 
 # ---------- 2. 更换落地 ----------
@@ -364,38 +379,23 @@ do_landing() {
   [[ -f "$STATE" ]] || die "这台机器不是用本脚本初始化的，请先选「初始化」"
   api_init
   ask_landing
-  apply_routing "$INBOUND_TAG"
+  apply_routing "$INBOUND_TAGS"
   restart_xray
   sed -i "s/^LANDING_TYPE=.*/LANDING_TYPE=$LANDING_TYPE/" "$STATE"
   self_test
 }
 
-# ---------- 3. 切换入口类型 ----------
-do_entry() {
-  [[ -f "$STATE" ]] || die "这台机器不是用本脚本初始化的，请先选「初始化」"
-  api_init
-  ask_entry
-  local ib body
-  ib=$(jget "$(api GET "inbounds/get/$INBOUND_ID")" obj)
-  body=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["listen"]=sys.argv[2]
-d.pop("clientStats", None); print(json.dumps(d))' "$ib" "$(entry_listen)")
-  api POST "inbounds/update/$INBOUND_ID" -H 'Content-Type: application/json' --data "$body" >/dev/null
-  restart_xray
-  sed -i "s/^ENTRY=.*/ENTRY=$ENTRY/" "$STATE"
-  echo "新的节点链接："; print_links
-}
-
 main() {
   need_root; ensure_deps
   case "${1:-}" in
-    init) do_init; exit ;; landing) do_landing; exit ;; entry) do_entry; exit ;; links) print_links; exit ;;
+    init) do_init; exit ;; landing) do_landing; exit ;; toggle) do_toggle; exit ;; links) print_links; exit ;;
   esac
   echo "==== 一键中转（3x-ui $XUI_VERSION / Xray $XRAY_VERSION）===="
   echo "1. 初始化"
   echo "2. 更换落地"
-  echo "3. 切换入口类型（仅IPv4 / 仅IPv6 / 都开）"
+  echo "3. 开关 IPv4 / IPv6 入站"
   echo "4. 输出链接"
   local c; ask c "请选择: "
-  case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_entry ;; 4) print_links ;; *) die "无效选择" ;; esac
+  case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_toggle ;; 4) print_links ;; *) die "无效选择" ;; esac
 }
 main "$@"
