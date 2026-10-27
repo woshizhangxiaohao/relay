@@ -327,20 +327,22 @@ do_init() {
     local go; ask go "仍然继续？[y/N]: " n; [[ "$go" == y ]] || die "已取消，换个伪装网站再来"
   fi
 
-  local keys uuid priv sid body res
-  keys=$(api GET server/getNewX25519Cert); priv=$(jget "$keys" obj.privateKey)
+  local keys uuid priv pub sid body res
+  keys=$(api GET server/getNewX25519Cert); priv=$(jget "$keys" obj.privateKey); pub=$(jget "$keys" obj.publicKey)
   uuid=$(jget "$(api GET server/getNewUUID)" obj.uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')
   sid=$(openssl rand -hex 8)
-  body=$(python3 - "$IN_PORT" "$(entry_listen)" "$uuid" "$SNI" "$priv" "$sid" <<'PY'
+  # realitySettings.settings.publicKey 不进 Xray 配置，但 3x-ui 面板导出分享链接要用它，缺了导出的链接连不上
+  body=$(python3 - "$IN_PORT" "$(entry_listen)" "$uuid" "$SNI" "$priv" "$sid" "$pub" <<'PY'
 import json, sys
-port, listen, uid, sni, priv, sid = sys.argv[1:7]
+port, listen, uid, sni, priv, sid, pub = sys.argv[1:8]
 print(json.dumps({"enable": True, "remark": "relay", "listen": listen, "port": int(port), "protocol": "vless",
   "expiryTime": 0, "total": 0,
   "settings": {"clients": [{"id": uid, "email": "relay", "flow": "xtls-rprx-vision", "enable": True}],
                "decryption": "none", "fallbacks": []},
   "streamSettings": {"network": "tcp", "security": "reality", "tcpSettings": {"header": {"type": "none"}},
     "realitySettings": {"show": False, "xver": 0, "target": f"{sni}:443", "serverNames": [sni],
-                        "privateKey": priv, "shortIds": [sid]}},
+                        "privateKey": priv, "shortIds": [sid],
+                        "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}}},
   "sniffing": {"enabled": False}}))
 PY
 )
