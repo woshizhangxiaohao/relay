@@ -238,10 +238,10 @@ do_toggle() {
   ask c "切换哪一个的开关？[1-$i]: "
   [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le $i ]] || die "无效选择"
   id=${ids[$((c - 1))]}
-  ib=$(jget "$(api GET "inbounds/get/$id")" obj)
-  ib=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["enable"]=not d["enable"]
-d.pop("clientStats", None); print(json.dumps(d))' "$ib")
-  api POST "inbounds/update/$id" -H 'Content-Type: application/json' --data "$ib" >/dev/null
+  # inbounds/update 会保留原 enable，开关要走 setEnable
+  local on; on=$(jget "$(api GET "inbounds/get/$id")" obj.enable)
+  api POST "inbounds/setEnable/$id" -H 'Content-Type: application/json' \
+    --data "{\"enable\": $([[ $on == True ]] && echo false || echo true)}" >/dev/null
   restart_xray
   echo "当前开启的节点链接："; print_links
 }
