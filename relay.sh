@@ -62,8 +62,11 @@ api() {
     || die "接口 $p 返回失败：$(printf '%s' "$out" | head -c 300)"
   printf '%s' "$out"
 }
+# 取 JSON 字段；3x-ui 有的接口把 obj 再编码成字符串，遇到字符串先解开
 jget() { python3 -c 'import json,sys; d=json.loads(sys.argv[1])
-for k in sys.argv[2].split("."): d=d[int(k)] if isinstance(d,list) else d[k]
+for k in sys.argv[2].split("."):
+    if isinstance(d,str): d=json.loads(d)
+    d=d[int(k)] if isinstance(d,list) else d[k]
 print(d if not isinstance(d,(dict,list)) else json.dumps(d))' "$1" "$2"; }
 
 wait_panel() {
