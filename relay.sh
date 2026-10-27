@@ -307,8 +307,11 @@ do_init() {
   curl -fLs -m 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o /tmp/xui-install.sh || die "下载 3x-ui 安装脚本失败"
   XUI_NONINTERACTIVE=1 XUI_USERNAME="$user" XUI_PASSWORD="$pass" XUI_PANEL_PORT="$PANEL_PORT" \
     XUI_WEB_BASE_PATH="$WEB_PATH" XUI_SSL_MODE=none XUI_ENABLE_FAIL2BAN=false \
-    bash /tmp/xui-install.sh "$XUI_VERSION" </dev/null >/tmp/xui-install.log 2>&1 || die "3x-ui 安装失败，日志：/tmp/xui-install.log"
-  rm -f /tmp/xui-install.sh
+    bash /tmp/xui-install.sh "$XUI_VERSION" </dev/null >/tmp/xui-install.log 2>&1 \
+    || { grep -vF -- "$pass" /tmp/xui-install.log > /tmp/xui-install.log.1; mv /tmp/xui-install.log.1 /tmp/xui-install.log
+         die "3x-ui 安装失败，日志：/tmp/xui-install.log"; }
+  # 官方安装日志会打印明文账号密码，成功后删掉
+  rm -f /tmp/xui-install.sh /tmp/xui-install.log /etc/x-ui/install-result.env
   # 已装过的机器安装脚本会沿用旧设置，这里强制写一遍
   "$XUI_BIN" setting -username "$user" -password "$pass" -port "$PANEL_PORT" -webBasePath "$WEB_PATH" >/dev/null
   unset pass pass2
