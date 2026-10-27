@@ -196,23 +196,41 @@ PY
   if [[ -z "$ip" ]]; then red "自检失败：经出口访问外网不通（落地不可用？）"; return 1; fi
   if [[ "$ip" == *:* ]]; then red "自检警告：出口用的是 IPv6（$ip），网站看到的不是 IPv4"; return 1; fi
   if [[ "$LANDING_TYPE" != none && "$ip" == "$(pub_ip4)" ]]; then red "自检失败：出口是本机 IP，没走落地"; return 1; fi
+  EXIT_IP=$ip
   green "自检通过：出口 IP = $ip"
 }
 
-# ---------- 入站：IPv4、IPv6 各一个，同端口、各用独立 UUID 和密钥 ----------
-# add_inbound <v4|v6> <监听地址>，输出 "id tag"
+# 出口 IP 的中文「国家+地区」，如 美国加利福尼亚；查不到输出空
+region_name() {
+  curl -s -m 8 "http://ip-api.com/json/$1?lang=zh-CN&fields=status,country,regionName" | python3 -c '
+import json, re, sys
+d = json.load(sys.stdin)
+if d.get("status") == "success":
+    r = d.get("regionName", "")
+    # 只给长名去后缀（加利福尼亚州→加利福尼亚），「加州」这类两个字的保持原样
+    print(d.get("country", "") + (re.sub(r"(特别行政区|特别市|广域市|州|省|市)$", "", r) if len(r) > 2 else r))' 2>/dev/null
+}
+
+# ---------- 入站：VLESS+Reality（TCP）、Hysteria2（UDP）各 IPv4、IPv6 一个，同端口、各用独立密钥 ----------
+# 输出 "id tag"
 add_inbound() {
-  local kind="$1" listen="$2" keys priv pub uuid sid body res
+  local proto="$1" kind="$2" listen="$3" res
+  res=$(api POST inbounds/add -H 'Content-Type: application/json' --data "$(inbound_body_$proto "$kind" "$listen")")
+  echo "$(jget "$res" obj.id) $(jget "$res" obj.tag)"
+}
+
+inbound_body_vless() {
+  local kind="$1" listen="$2" keys priv pub uuid sid
   keys=$(api GET server/getNewX25519Cert); priv=$(jget "$keys" obj.privateKey); pub=$(jget "$keys" obj.publicKey)
   uuid=$(jget "$(api GET server/getNewUUID)" obj.uuid 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')
   sid=$(openssl rand -hex 8)
   # realitySettings.settings.publicKey 不进 Xray 配置，但 3x-ui 面板导出分享链接要用它，缺了导出的链接连不上
-  body=$(python3 - "$IN_PORT" "$listen" "$uuid" "$SNI" "$priv" "$sid" "$pub" "$kind" <<'PY'
+  python3 - "$IN_PORT" "$listen" "$uuid" "$SNI" "$priv" "$sid" "$pub" "$kind" "$NODE_NAME" <<'PY'
 import json, sys
-port, listen, uid, sni, priv, sid, pub, kind = sys.argv[1:9]
-print(json.dumps({"enable": True, "remark": f"relay-{kind}", "listen": listen, "port": int(port), "protocol": "vless",
+port, listen, uid, sni, priv, sid, pub, kind, name = sys.argv[1:10]
+print(json.dumps({"enable": True, "remark": f"{name}-VLESS-{kind}", "listen": listen, "port": int(port), "protocol": "vless",
   "expiryTime": 0, "total": 0,
-  "settings": {"clients": [{"id": uid, "email": f"relay-{kind}", "flow": "xtls-rprx-vision", "enable": True}],
+  "settings": {"clients": [{"id": uid, "email": f"relay-vless-{kind}", "flow": "xtls-rprx-vision", "enable": True}],
                "decryption": "none", "fallbacks": []},
   "streamSettings": {"network": "tcp", "security": "reality", "tcpSettings": {"header": {"type": "none"}},
     "realitySettings": {"show": False, "xver": 0, "target": f"{sni}:443", "serverNames": [sni],
@@ -220,12 +238,42 @@ print(json.dumps({"enable": True, "remark": f"relay-{kind}", "listen": listen, "
                         "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}}},
   "sniffing": {"enabled": False}}))
 PY
-)
-  res=$(api POST inbounds/add -H 'Content-Type: application/json' --data "$body")
-  echo "$(jget "$res" obj.id) $(jget "$res" obj.tag)"
 }
 
-# ---------- 3. 开关 IPv4 / IPv6 入站 ----------
+# 自签证书（ECDSA P-256），客户端用证书指纹固定（pinSHA256）验证，不用 insecure
+HY2_CRT=/etc/x-ui/relay-hy2.crt
+HY2_KEY=/etc/x-ui/relay-hy2.key
+ensure_hy2_cert() {
+  [[ -s $HY2_CRT && -s $HY2_KEY ]] && return
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj "/CN=$SNI" -addext "subjectAltName=DNS:$SNI" -keyout "$HY2_KEY" -out "$HY2_CRT" >/dev/null 2>&1 || die "生成 hy2 证书失败"
+  chmod 600 "$HY2_KEY"
+}
+cert_pin() { openssl x509 -in "$1" -outform der | openssl dgst -sha256 -hex | awk '{print $NF}'; }
+
+inbound_body_hy2() {
+  local kind="$1" listen="$2"
+  ensure_hy2_cert
+  # 混淆（salamander）、伪装成 https://伪装网站、只用 TLS 1.3；pinnedPeerCertSha256 供面板导出链接
+  python3 - "$IN_PORT" "$listen" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" "$SNI" "$(cert_pin $HY2_CRT)" \
+    "$HY2_CRT" "$HY2_KEY" "$kind" "$NODE_NAME" <<'PY'
+import json, sys
+port, listen, auth, obfs, sni, pin, crt, key, kind, name = sys.argv[1:11]
+print(json.dumps({"enable": True, "remark": f"{name}-HY2-{kind}", "listen": listen, "port": int(port), "protocol": "hysteria",
+  "expiryTime": 0, "total": 0,
+  "settings": {"version": 2, "clients": [{"auth": auth, "email": f"relay-hy2-{kind}", "enable": True}]},
+  "streamSettings": {"network": "hysteria", "security": "tls",
+    "tlsSettings": {"serverName": sni, "minVersion": "1.3", "alpn": ["h3"],
+                    "certificates": [{"certificateFile": crt, "keyFile": key}],
+                    "settings": {"fingerprint": "chrome", "pinnedPeerCertSha256": [pin]}},
+    "hysteriaSettings": {"version": 2, "udpIdleTimeout": 60,
+                         "masquerade": {"type": "proxy", "url": f"https://{sni}", "rewriteHost": True}},
+    "finalmask": {"udp": [{"type": "salamander", "settings": {"password": obfs}}]}},
+  "sniffing": {"enabled": False}}))
+PY
+}
+
+# ---------- 3. 开关入站 ----------
 do_toggle() {
   [[ -f "$STATE" ]] || die "这台机器不是用本脚本初始化的，请先选「初始化」"
   api_init
@@ -250,32 +298,46 @@ do_toggle() {
 print_links() {
   [[ -f "$XRAY_CONF" ]] || die "找不到 $XRAY_CONF，3x-ui 没装？"
   local xb v4 v6 name
-  xb=$(xray_bin); v4=$(pub_ip4); v6=$(local_ip6); name="${RELAY_NAME:-$(hostname -s)}"
-  python3 - "$XRAY_CONF" "$xb" "$v4" "$v6" "$name" "$(local_ip4)" <<'PY' | tee "$LINKS"
+  # shellcheck disable=SC1090
+  [[ -f "$STATE" ]] && source "$STATE"
+  xb=$(xray_bin); v4=$(pub_ip4); v6=$(local_ip6); name="${RELAY_NAME:-${NODE_NAME:-$(hostname -s)}}"
+  python3 - "$XRAY_CONF" "$xb" "$v4" "$v6" "$name" <<'PY' | tee "$LINKS"
 import json, subprocess, sys, urllib.parse as u
-conf, xb, v4, v6, name, lip4 = sys.argv[1:7]
+conf, xb, v4, v6, name = sys.argv[1:6]
 c = json.load(open(conf))
+def hosts_of(listen):
+    if listen in ("", "0.0.0.0", "::"):
+        return [h for h in (("v4", v4), ("v6", v6)) if h[1]]
+    if ":" in listen: return [("v6", listen)]
+    return [("v4", v4)] if v4 else []
 for ib in c.get("inbounds", []):
     ss = ib.get("streamSettings") or {}
-    if ib.get("protocol") != "vless" or ss.get("security") != "reality": continue
-    rs = ss["realitySettings"]
-    pub = subprocess.run([xb, "x25519", "-i", rs["privateKey"]], capture_output=True, text=True).stdout
-    pbk = next((l.split(":", 1)[1].strip() for l in pub.splitlines() if l.lower().startswith(("public", "password"))), "")
-    listen = ib.get("listen") or ""
-    hosts = []
-    if listen in ("", "0.0.0.0", "::"):
-        if v4: hosts.append(("v4", v4))
-        if v6: hosts.append(("v6", v6))
-    elif ":" in listen: hosts.append(("v6", listen))
-    elif v4: hosts.append(("v4", v4))
-    for cl in ib["settings"].get("clients", []):
-        for kind, h in hosts:
-            q = {"encryption": "none", "flow": cl.get("flow", ""), "security": "reality",
-                 "sni": (rs.get("serverNames") or [""])[0], "fp": "chrome", "pbk": pbk,
-                 "sid": (rs.get("shortIds") or [""])[0], "spx": "/", "type": ss.get("network", "tcp")}
-            q = {k: v for k, v in q.items() if v != ""}
-            hh = f"[{h}]" if ":" in h else h
-            print(f"[{kind}] vless://{cl['id']}@{hh}:{ib['port']}?{u.urlencode(q)}#{u.quote(name + '-' + kind)}")
+    st = ib.get("settings") or {}
+    for kind, h in hosts_of(ib.get("listen") or ""):
+        hh = f"[{h}]" if ":" in h else h
+        if ib.get("protocol") == "vless" and ss.get("security") == "reality":
+            rs = ss["realitySettings"]
+            out = subprocess.run([xb, "x25519", "-i", rs["privateKey"]], capture_output=True, text=True).stdout
+            pbk = next((l.split(":", 1)[1].strip() for l in out.splitlines() if l.lower().startswith(("public", "password"))), "")
+            for cl in st.get("clients", []):
+                q = {"encryption": "none", "flow": cl.get("flow", ""), "security": "reality",
+                     "sni": (rs.get("serverNames") or [""])[0], "fp": "chrome", "pbk": pbk,
+                     "sid": (rs.get("shortIds") or [""])[0], "spx": "/", "type": ss.get("network", "tcp")}
+                q = {k: v for k, v in q.items() if v != ""}
+                print(f"[VLESS-{kind}] vless://{cl['id']}@{hh}:{ib['port']}?{u.urlencode(q)}#{u.quote(f'{name}-VLESS-{kind}')}")
+        elif ib.get("protocol") == "hysteria":
+            ts = ss.get("tlsSettings") or {}
+            crt = ((ts.get("certificates") or [{}])[0]).get("certificateFile", "")
+            der = subprocess.run(["openssl", "x509", "-in", crt, "-outform", "der"], capture_output=True).stdout if crt else b""
+            import hashlib
+            pin = hashlib.sha256(der).hexdigest() if der else ""
+            obfs = next((m.get("settings", {}).get("password", "") for m in (ss.get("finalmask") or {}).get("udp", [])
+                         if m.get("type") == "salamander"), "")
+            for cl in st.get("clients", []) or st.get("users", []):
+                q = {"sni": ts.get("serverName", ""), "alpn": ",".join(ts.get("alpn") or []), "insecure": "0", "pinSHA256": pin}
+                if obfs: q.update({"obfs": "salamander", "obfs-password": obfs})
+                q = {k: v for k, v in q.items() if v != ""}
+                print(f"[HY2-{kind}] hysteria2://{u.quote(cl['auth'], safe='')}@{hh}:{ib['port']}/?{u.urlencode(q)}#{u.quote(f'{name}-HY2-{kind}')}")
 PY
   chmod 600 "$LINKS"
 }
@@ -287,16 +349,19 @@ PANEL_PORT=$PANEL_PORT
 IN_PORT=$IN_PORT
 SNI=$SNI
 LANDING_TYPE=$LANDING_TYPE
+NODE_NAME="$NODE_NAME"
 INBOUND_IDS="$INBOUND_IDS"
 INBOUND_TAGS=$INBOUND_TAGS
 EOF
 }
 
+# 入站端口放行 TCP（VLESS）和 UDP（hy2），面板端口放行 TCP
 open_firewall() {
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow "$1"/tcp >/dev/null; ufw allow "$2"/tcp >/dev/null
+    ufw allow "$1"/tcp >/dev/null; ufw allow "$1"/udp >/dev/null; ufw allow "$2"/tcp >/dev/null
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd -q --permanent --add-port="$1"/tcp; firewall-cmd -q --permanent --add-port="$2"/tcp; firewall-cmd -q --reload
+    firewall-cmd -q --permanent --add-port="$1"/tcp; firewall-cmd -q --permanent --add-port="$1"/udp
+    firewall-cmd -q --permanent --add-port="$2"/tcp; firewall-cmd -q --reload
   fi
 }
 
@@ -316,6 +381,7 @@ do_init() {
   ask IN_PORT "入站端口 [443]: " 443
   ask SNI "伪装网站 [calmerry.com]: " calmerry.com
   ask_landing
+  ask NODE_NAME "节点名称（回车 = 按出口 IP 的国家地区自动命名，如 美国加利福尼亚）: "
   [[ -n "$(local_ip6)" ]] || yellow "本机没有公网 IPv6，只建 IPv4 入站（要 IPv6 先去服务商面板开启，再重新初始化）"
 
   if [[ -x "$XUI_BIN" ]]; then
@@ -329,6 +395,7 @@ do_init() {
     rm -f /etc/x-ui/x-ui.db "$STATE" "$LINKS"
   fi
   port_busy "$IN_PORT" && die "入站端口 $IN_PORT 已被占用：$(ss -Hltnp "sport = :$IN_PORT" | head -1)"
+  ss -Hlun "sport = :$IN_PORT" | grep -q . && die "入站端口 $IN_PORT 的 UDP 已被占用：$(ss -Hlunp "sport = :$IN_PORT" | head -1)"
   port_busy "$PANEL_PORT" && die "面板端口 $PANEL_PORT 已被占用"
 
   green "安装 3x-ui $XUI_VERSION ..."
@@ -355,23 +422,34 @@ do_init() {
     local go; ask go "仍然继续？[y/N]: " n; [[ "$go" == y ]] || die "已取消，换个伪装网站再来"
   fi
 
-  local r ip6
-  r=$(add_inbound v4 "$(local_ip4)")
-  INBOUND_IDS=${r%% *}; INBOUND_TAGS=${r#* }
-  ip6=$(local_ip6)
-  if [[ -n "$ip6" ]]; then
-    r=$(add_inbound v6 "$ip6")
-    INBOUND_IDS="$INBOUND_IDS ${r%% *}"; INBOUND_TAGS="$INBOUND_TAGS,${r#* }"
+  # 先测出口，用出口 IP 的国家地区给节点命名
+  local ok_exit=1
+  self_test || { ok_exit=0; yellow "（自检没过，配置照样建好，可以之后用「更换落地」重新设置）"; }
+  if [[ -z "$NODE_NAME" ]]; then
+    [[ -n "${EXIT_IP:-}" ]] && NODE_NAME=$(region_name "$EXIT_IP")
+    NODE_NAME=${NODE_NAME:-节点}
   fi
+  green "节点名称：$NODE_NAME"
+
+  local r ip6 proto kind listen
+  INBOUND_IDS=""; INBOUND_TAGS=""
+  ip6=$(local_ip6)
+  for proto in vless hy2; do
+    for kind in v4 v6; do
+      if [[ $kind == v4 ]]; then listen=$(local_ip4); else listen=$ip6; [[ -n "$ip6" ]] || continue; fi
+      r=$(add_inbound "$proto" "$kind" "$listen")
+      INBOUND_IDS="${INBOUND_IDS:+$INBOUND_IDS }${r%% *}"; INBOUND_TAGS="${INBOUND_TAGS:+$INBOUND_TAGS,}${r#* }"
+    done
+  done
 
   apply_routing "$INBOUND_TAGS"
   restart_xray
   open_firewall "$IN_PORT" "$PANEL_PORT"
   save_state
-  self_test || yellow "（自检没过，配置已保存，可以用「更换落地」重新设置）"
   echo; show_panel
   echo "节点链接（同时保存在 $LINKS）："; print_links
-  [[ -n "$ip6" ]] && yellow "IPv4、IPv6 是两个独立节点（密钥不同）。都导入 Shadowrocket，可建「故障转移」策略组自动切换。"
+  yellow "每条链接是独立节点（密钥各不相同）。都导入客户端，哪条能用就用哪条。"
+  [[ $ok_exit == 1 ]] || red "注意：上面自检没通过，落地可能不可用。"
 }
 
 # ---------- 2. 更换落地 ----------
@@ -393,7 +471,7 @@ main() {
   echo "==== 一键中转（3x-ui $XUI_VERSION / Xray $XRAY_VERSION）===="
   echo "1. 初始化"
   echo "2. 更换落地"
-  echo "3. 开关 IPv4 / IPv6 入站"
+  echo "3. 开关入站（VLESS / HY2 × IPv4 / IPv6）"
   echo "4. 输出链接"
   local c; ask c "请选择: "
   case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_toggle ;; 4) print_links ;; *) die "无效选择" ;; esac
