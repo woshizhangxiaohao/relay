@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # 一键中转 / 落地：安装 3x-ui 并配好 VLESS + Reality 入站、落地出站和转发规则。
-# 用法：bash <(curl -Ls https://raw.githubusercontent.com/woshizhangxiaohao/relay/main/relay.sh)
+# 用法：下载完整仓库后运行 bash relay.sh；DNS/证书/网页见 README。
 # 本脚本不含任何密码或密钥；面板账号密码运行时输入，只写进本机 3x-ui。
-set -uo pipefail
+set -euo pipefail
+umask 077
+RELAY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 XUI_VERSION="${RELAY_XUI_VERSION:-v3.11.0}"
 XRAY_VERSION="${RELAY_XRAY_VERSION:-v26.6.27}"
@@ -21,7 +23,48 @@ yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { red "错误：$*"; exit 1; }
 ask() { local __v="$1" __p="$2" __d="${3:-}" __a; read -r -p "$__p" __a </dev/tty; printf -v "$__v" '%s' "${__a:-$__d}"; }
 
+# 同一个版本的脚本、网页与迁移工具须成套使用。
+require_bundle() {
+  local x
+  for x in relay-web.py relay-dns.py relay-tcp.py relay-udp.py relay-panel.py relay_hot.py site/index.html; do
+    [[ -f "$RELAY_DIR/$x" ]] || die "需要完整的 relay 目录（缺少 $x），请按 README 下载同一版本。"
+  done
+}
+
+prepare_new_web() {
+  ask SNI "本节点的自有子域名（例如 lax1.ununu.dev）: "
+  [[ -n "$SNI" ]] || die "必须填写自己的节点域名"
+  if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    local zone ip4 ip6
+    ask zone "Cloudflare zone（例如 ununu.dev）: "
+    ip4=$(pub_ip4); ip6=$(pub_ip6 || true)
+    local record_args=(--host "$SNI" --zone "$zone" --ipv4 "$ip4" --apply)
+    if [[ -n "$ip6" ]]; then record_args+=(--ipv6 "$ip6"); fi
+    python3 "$RELAY_DIR/relay-dns.py" "${record_args[@]}" || die "DNS 未就绪"
+    unset CLOUDFLARE_API_TOKEN
+  else
+    echo "使用管理端已建的灰云记录；还没有记录时先用 relay.sh dns。"
+  fi
+  if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+    ufw allow 80/tcp >/dev/null
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd -q --permanent --add-port=80/tcp; firewall-cmd -q --add-port=80/tcp
+  fi
+  python3 "$RELAY_DIR/relay-web.py" "$SNI" || die "证书或本机静态站未通过；不创建入站"
+}
+
 need_root() { [[ $EUID -eq 0 ]] || die "请用 root 运行"; }
+
+verify_file() {
+  python3 -c 'import hashlib,sys; sys.exit(0 if hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()==sys.argv[2] else 1)' "$1" "$2" || die "文件摘要未通过：$1"
+}
+
+# 暂存文件转入仅 root 可读的运行时回收目录，系统重启后自然清理。
+retire_tmp() {
+  local dest; install -d -m 700 /run/relay-retired
+  dest=$(mktemp -d /run/relay-retired/old.XXXXXXXX)
+  local item; for item in "$@"; do [[ ! -e "$item" ]] || mv -- "$item" "$dest/"; done
+}
 
 ensure_deps() {
   local miss=()
@@ -59,7 +102,7 @@ api() {
   local out
   out=$(curl -s -m 120 -X "$m" -H "Authorization: Bearer $TOKEN" "$API_BASE/$p" "$@") || die "接口 $p 请求失败"
   python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d.get("success") else 1)' "$out" 2>/dev/null \
-    || die "接口 $p 返回失败：$(printf '%s' "$out" | head -c 300)"
+    || die "接口 $p 返回失败（响应可能含凭据，不回显）"
   printf '%s' "$out"
 }
 # 取 JSON 字段；3x-ui 有的接口把 obj 再编码成字符串，遇到字符串先解开
@@ -87,10 +130,17 @@ install_xray() {
   tmp=$(mktemp -d)
   curl -fLs -m 180 -o "$tmp/x.zip" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${zip_arch}.zip" \
     || die "下载 Xray $XRAY_VERSION 失败"
+  local pinned="${RELAY_XRAY_SHA256:-}"
+  if [[ -z "$pinned" && "$XRAY_VERSION" == v26.6.27 ]]; then
+    if [[ "$bin_arch" == amd64 ]]; then pinned=b3e5902d06d6282fe53cfa2fc426058b9aeaa429b2c812e20887cd47f26d08bf
+    else pinned=13a251379bea366c2cf10363ad71e75734193d401f26f518bf0c25e5c8f8c931; fi
+  fi
+  [[ -n "$pinned" ]] || die "非默认 Xray 版本需要提供 RELAY_XRAY_SHA256"
+  verify_file "$tmp/x.zip" "$pinned"
   python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extract("xray", sys.argv[2])' "$tmp/x.zip" "$tmp" || die "解压 Xray 失败"
   systemctl stop x-ui
   install -m 755 "$tmp/xray" "$XUI_DIR/bin/xray-linux-${bin_arch}"
-  rm -rf "$tmp"
+  retire_tmp "$tmp"
   systemctl start x-ui; wait_panel
   "$(xray_bin)" version | head -1
 }
@@ -139,8 +189,8 @@ PY
 }
 
 ask_landing() {
-  echo "是否需要落地？"
-  echo "  1. 不需要（本机直接出去，也可以给别的中转机当落地）"
+  echo "要另外配置落地出口吗？（可选）"
+  echo "  1. 本机直出（默认，不需要家宽；也可以给别的中转机当落地）"
   echo "  2. SOCKS5（粘贴卖家给的那一行，如 IP|端口|账号|密码|到期）"
   echo "  3. 自己的落地机（粘贴那台机器输出的 vless:// 链接）"
   local c; ask c "请选择 [1]: " 1
@@ -191,10 +241,10 @@ print(json.dumps({"log": {"loglevel": "warning"},
 PY
   "$xb" run -c "$tmp/c.json" >"$tmp/log" 2>&1 & local pid=$!
   sleep 2
-  ip=$(curl -s -m 15 --socks5-hostname "127.0.0.1:$sp" https://api64.ipify.org)
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$tmp"
+  ip=$(curl --noproxy '' -fsS -m 15 --socks5-hostname "127.0.0.1:$sp" https://api64.ipify.org) || ip=""
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; retire_tmp "$tmp"
   if [[ -z "$ip" ]]; then red "自检失败：经出口访问外网不通（落地不可用？）"; return 1; fi
-  if [[ "$ip" == *:* ]]; then red "自检警告：出口用的是 IPv6（$ip），网站看到的不是 IPv4"; return 1; fi
+  python3 -c 'import ipaddress,sys;sys.exit(0 if ipaddress.IPv4Address(sys.argv[1]).is_global else 1)' "$ip" 2>/dev/null || { red "出口没有返回可验证的公网 IPv4"; return 1; }
   if [[ "$LANDING_TYPE" != none && "$ip" == "$(pub_ip4)" ]]; then red "自检失败：出口是本机 IP，没走落地"; return 1; fi
   EXIT_IP=$ip
   green "自检通过：出口 IP = $ip"
@@ -214,8 +264,9 @@ if d.get("status") == "success":
 # ---------- 入站：VLESS+Reality（TCP）、Hysteria2（UDP）各 IPv4、IPv6 一个，同端口、各用独立密钥 ----------
 # 输出 "id tag"
 add_inbound() {
-  local proto="$1" kind="$2" listen="$3" res
-  res=$(api POST inbounds/add -H 'Content-Type: application/json' --data "$(inbound_body_$proto "$kind" "$listen")")
+  local proto="$1" kind="$2" listen="$3" res payload
+  payload=$(inbound_body_$proto "$kind" "$listen") || die "生成 $proto / $kind 入站失败"
+  res=$(api POST inbounds/add -H 'Content-Type: application/json' --data "$payload") || die "创建 $proto / $kind 入站失败"
   echo "$(jget "$res" obj.id) $(jget "$res" obj.tag)"
 }
 
@@ -228,12 +279,12 @@ inbound_body_vless() {
   python3 - "$IN_PORT" "$listen" "$uuid" "$SNI" "$priv" "$sid" "$pub" "$kind" "$NODE_NAME" <<'PY'
 import json, sys
 port, listen, uid, sni, priv, sid, pub, kind, name = sys.argv[1:10]
-print(json.dumps({"enable": True, "remark": f"{name}-VLESS-{kind}", "listen": listen, "port": int(port), "protocol": "vless",
+print(json.dumps({"enable": True, "remark": f"{name}-TCP-VLESS-IP{kind}", "listen": listen, "port": int(port), "protocol": "vless",
   "expiryTime": 0, "total": 0,
   "settings": {"clients": [{"id": uid, "email": f"relay-vless-{kind}", "flow": "xtls-rprx-vision", "enable": True}],
                "decryption": "none", "fallbacks": []},
   "streamSettings": {"network": "tcp", "security": "reality", "tcpSettings": {"header": {"type": "none"}},
-    "realitySettings": {"show": False, "xver": 0, "target": f"{sni}:443", "serverNames": [sni],
+    "realitySettings": {"show": False, "xver": 0, "target": "127.0.0.1:8443", "serverNames": [sni],
                         "privateKey": priv, "shortIds": [sid],
                         "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}}},
   "sniffing": {"enabled": False}}))
@@ -254,12 +305,12 @@ cert_pin() { openssl x509 -in "$1" -outform der | openssl dgst -sha256 -hex | aw
 inbound_body_hy2() {
   local kind="$1" listen="$2"
   ensure_hy2_cert
-  # 混淆（salamander）、伪装成 https://伪装网站、只用 TLS 1.3；pinnedPeerCertSha256 供面板导出链接
+  # 未认证 HTTP/3 只返回固定的本机 404；网页证书的续期不影响 HY2 指纹。
   python3 - "$IN_PORT" "$listen" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" "$SNI" "$(cert_pin $HY2_CRT)" \
     "$HY2_CRT" "$HY2_KEY" "$kind" "$NODE_NAME" <<'PY'
 import json, sys
 port, listen, auth, obfs, sni, pin, crt, key, kind, name = sys.argv[1:11]
-print(json.dumps({"enable": True, "remark": f"{name}-HY2-{kind}", "listen": listen, "port": int(port), "protocol": "hysteria",
+print(json.dumps({"enable": True, "remark": f"{sni}-UDP-HY2-IP{kind}", "listen": listen, "port": int(port), "protocol": "hysteria",
   "expiryTime": 0, "total": 0,
   "settings": {"version": 2, "clients": [{"auth": auth, "email": f"relay-hy2-{kind}", "enable": True}]},
   "streamSettings": {"network": "hysteria", "security": "tls",
@@ -267,7 +318,7 @@ print(json.dumps({"enable": True, "remark": f"{name}-HY2-{kind}", "listen": list
                     "certificates": [{"certificateFile": crt, "keyFile": key}],
                     "settings": {"fingerprint": "chrome", "pinnedPeerCertSha256": [pin]}},
     "hysteriaSettings": {"version": 2, "udpIdleTimeout": 60,
-                         "masquerade": {"type": "proxy", "url": f"https://{sni}", "rewriteHost": True}},
+                         "masquerade": {"type": "string", "statusCode": 404, "content": "Not Found"}},
     "finalmask": {"udp": [{"type": "salamander", "settings": {"password": obfs}}]}},
   "sniffing": {"enabled": False}}))
 PY
@@ -288,6 +339,15 @@ do_toggle() {
   id=${ids[$((c - 1))]}
   # inbounds/update 会保留原 enable，开关要走 setEnable
   local on; on=$(jget "$(api GET "inbounds/get/$id")" obj.enable)
+  if [[ $on != True ]]; then
+    local entry; entry=$(api GET "inbounds/get/$id")
+    python3 -c 'import json,sys
+v=json.load(sys.stdin)["obj"];s=v.get("streamSettings",{})
+if isinstance(s,str): s=json.loads(s)
+p=v.get("protocol");r=s.get("realitySettings",{});h=s.get("hysteriaSettings",{}).get("masquerade",{})
+ok=(p=="vless" and s.get("security")=="reality" and r.get("target",r.get("dest"))=="127.0.0.1:8443" and r.get("serverNames")==[open("/etc/relay-local-web/hostname").read().strip()]) or (p=="hysteria" and h.get("type","") in ("","string"))
+sys.exit(0 if ok else 1)' <<<"$entry" || die "旧入站未满足本机响应规则，不直接启用"
+  fi
   api POST "inbounds/setEnable/$id" -H 'Content-Type: application/json' \
     --data "{\"enable\": $([[ $on == True ]] && echo false || echo true)}" >/dev/null
   restart_xray
@@ -300,7 +360,7 @@ print_links() {
   local xb v4 v6 name
   # shellcheck disable=SC1090
   [[ -f "$STATE" ]] && source "$STATE"
-  xb=$(xray_bin); v4=$(pub_ip4); v6=$(local_ip6); name="${RELAY_NAME:-${NODE_NAME:-$(hostname -s)}}"
+  xb=$(xray_bin); v4=$(pub_ip4); v6=$(local_ip6 || true); name="${RELAY_NAME:-${NODE_NAME:-$(hostname -s)}}"
   python3 - "$XRAY_CONF" "$xb" "$v4" "$v6" "$name" <<'PY' | tee "$LINKS"
 import json, subprocess, sys, urllib.parse as u
 conf, xb, v4, v6, name = sys.argv[1:6]
@@ -324,7 +384,8 @@ for ib in c.get("inbounds", []):
                      "sni": (rs.get("serverNames") or [""])[0], "fp": "chrome", "pbk": pbk,
                      "sid": (rs.get("shortIds") or [""])[0], "spx": "/", "type": ss.get("network", "tcp")}
                 q = {k: v for k, v in q.items() if v != ""}
-                print(f"[VLESS-{kind}] vless://{cl['id']}@{hh}:{ib['port']}?{u.urlencode(q)}#{u.quote(f'{name}-VLESS-{kind}')}")
+                label = f"{name}-TCP-VLESS-IP{kind}"
+                print(f"[VLESS-{kind}] vless://{cl['id']}@{hh}:{ib['port']}?{u.urlencode(q)}#{u.quote(label)}")
         elif ib.get("protocol") == "hysteria":
             ts = ss.get("tlsSettings") or {}
             crt = ((ts.get("certificates") or [{}])[0]).get("certificateFile", "")
@@ -337,103 +398,119 @@ for ib in c.get("inbounds", []):
                 q = {"sni": ts.get("serverName", ""), "alpn": ",".join(ts.get("alpn") or []), "insecure": "0", "pinSHA256": pin}
                 if obfs: q.update({"obfs": "salamander", "obfs-password": obfs})
                 q = {k: v for k, v in q.items() if v != ""}
-                print(f"[HY2-{kind}] hysteria2://{u.quote(cl['auth'], safe='')}@{hh}:{ib['port']}/?{u.urlencode(q)}#{u.quote(f'{name}-HY2-{kind}')}")
+                m=(ss.get("hysteriaSettings") or {}).get("masquerade") or {}
+                label=(f"{ts['serverName']}-UDP-HY2-IP{kind}" if ts.get("serverName") and m.get("type")=="string" and m.get("statusCode")==404 else f"{name}-HY2-{kind}")
+                print(f"[HY2-{kind}] hysteria2://{u.quote(cl['auth'], safe='')}@{hh}:{ib['port']}/?{u.urlencode(q)}#{u.quote(label)}")
 PY
   chmod 600 "$LINKS"
 }
 
 save_state() {
   umask 077
-  cat > "$STATE" <<EOF
-PANEL_PORT=$PANEL_PORT
-IN_PORT=$IN_PORT
-SNI=$SNI
-LANDING_TYPE=$LANDING_TYPE
-NODE_NAME="$NODE_NAME"
-INBOUND_IDS="$INBOUND_IDS"
-INBOUND_TAGS=$INBOUND_TAGS
-EOF
+  [[ "$INBOUND_TAGS" =~ ^[a-zA-Z0-9_.,:-]+$ ]] || die "入站标签不合法"
+  {
+    printf 'PANEL_PORT=%q\nIN_PORT=%q\nSNI=%q\nLANDING_TYPE=%q\nNODE_NAME=%q\nINBOUND_IDS=%q\n' "$PANEL_PORT" "$IN_PORT" "$SNI" "$LANDING_TYPE" "$NODE_NAME" "$INBOUND_IDS"
+    printf 'INBOUND_TAGS=%s\n' "$INBOUND_TAGS"
+  } > "$STATE"
 }
 
-# 入站端口放行 TCP（VLESS）和 UDP（hy2），面板端口放行 TCP
+# 新机只开放节点端口；面板和本机网页不对公网开放。
 open_firewall() {
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow "$1"/tcp >/dev/null; ufw allow "$1"/udp >/dev/null; ufw allow "$2"/tcp >/dev/null
+    ufw allow "$1"/tcp >/dev/null; ufw allow "$1"/udp >/dev/null
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd -q --permanent --add-port="$1"/tcp; firewall-cmd -q --permanent --add-port="$1"/udp
-    firewall-cmd -q --permanent --add-port="$2"/tcp; firewall-cmd -q --reload
+    firewall-cmd -q --add-port="$1"/tcp; firewall-cmd -q --add-port="$1"/udp
   fi
 }
 
 show_panel() {
-  local h; h=$(pub_ip4); [[ -n "$h" ]] || h="[$(local_ip6)]"
-  green "面板：http://${h}:${PANEL_PORT}/${WEB_PATH}/"
+  green "面板只监听 127.0.0.1:${PANEL_PORT}/${WEB_PATH}/"
+  echo "可以另开独立的公网 HTTPS 入口；也可以通过 SSH 转发访问本机面板。"
+}
+
+panel_choice() {
+  local choice ipline
+  echo "公网 HTTPS 管理面板（原账号密码，不修改四条节点）"
+  echo "  0. 保持当前设置（新机默认不开放）"
+  echo "  1. 公网 HTTPS，用原面板登录"
+  echo "  2. 公网 HTTPS，只让指定公网 IP 访问登录页"
+  echo "  3. 查看当前入口"
+  echo "  4. 关闭公网面板，保留服务器本机访问"
+  ask choice "请选择 [0]: " 0
+  case "$choice" in
+    0) return 0 ;;
+    1) python3 "$RELAY_DIR/relay-panel.py" enable --login ;;
+    2) ask ipline "允许登录的公网 IP（多个用空格隔开）: "
+       local ips=() opts=() x; read -r -a ips <<<"$ipline"
+       for x in "${ips[@]}"; do opts+=(--allow-ip "$x"); done
+       [[ ${#opts[@]} -gt 0 ]] || die "白名单不能为空"
+       python3 "$RELAY_DIR/relay-panel.py" enable "${opts[@]}" ;;
+    3) python3 "$RELAY_DIR/relay-panel.py" status ;;
+    4) python3 "$RELAY_DIR/relay-panel.py" disable ;;
+    *) die "无效选择" ;;
+  esac
 }
 
 # ---------- 1. 初始化 ----------
 do_init() {
-  local user pass pass2
+  local user pass pass2 setup
+  [[ ! -e "$XUI_BIN" && ! -e /etc/x-ui/x-ui.db ]] || die "已有面板：禁止重新初始化。保留 UDP 迁移请用 tcp-plan / tcp-apply。"
   ask user "面板账号: "; [[ -n "$user" ]] || die "账号不能为空"
   read -r -s -p "面板密码: " pass </dev/tty; echo
   read -r -s -p "再输一次密码: " pass2 </dev/tty; echo
   [[ -n "$pass" && "$pass" == "$pass2" ]] || die "两次密码不一致或为空"
   ask PANEL_PORT "面板端口 [8888]: " 8888
   ask IN_PORT "入站端口 [443]: " 443
-  ask SNI "伪装网站 [calmerry.com]: " calmerry.com
+  [[ "$IN_PORT" =~ ^[1-9][0-9]{0,4}$ && "$PANEL_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( IN_PORT <= 65535 && PANEL_PORT <= 65535 )) || die "端口必须在 1 到 65535 之间"
+  [[ "$IN_PORT" != "$PANEL_PORT" && "$IN_PORT" != 80 && "$IN_PORT" != 8443 && "$PANEL_PORT" != 80 && "$PANEL_PORT" != 8443 ]] || die "端口冲突（80 用于续证；8443 为本机静态页）"
+  prepare_new_web
   ask_landing
   ask NODE_NAME "节点名称（回车 = 按出口 IP 的国家地区自动命名，如 美国加利福尼亚）: "
-  [[ -n "$(local_ip6)" ]] || yellow "本机没有公网 IPv6，只建 IPv4 入站（要 IPv6 先去服务商面板开启，再重新初始化）"
+  [[ -n "$(local_ip6 || true)" ]] || yellow "本机没有可用 IPv6，只建 IPv4 入站；要双栈请先给空服务器配置公网 IPv6。"
 
-  if [[ -x "$XUI_BIN" ]]; then
-    yellow "本机已装 3x-ui。初始化会清空现有面板配置（节点、账号都会重建）。"
-    local ok; ask ok "输入 yes 继续（会先备份）: "
-    [[ "$ok" == yes ]] || die "已取消"
-    local bk="/root/relay-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar czf "$bk" /etc/x-ui "$XUI_DIR" 2>/dev/null || die "备份失败"
-    green "已备份到 $bk"
-    systemctl stop x-ui
-    rm -f /etc/x-ui/x-ui.db "$STATE" "$LINKS"
-  fi
+  # 只在空服务器初始化，绝不清空已有面板。
+
   port_busy "$IN_PORT" && die "入站端口 $IN_PORT 已被占用：$(ss -Hltnp "sport = :$IN_PORT" | head -1)"
   ss -Hlun "sport = :$IN_PORT" | grep -q . && die "入站端口 $IN_PORT 的 UDP 已被占用：$(ss -Hlunp "sport = :$IN_PORT" | head -1)"
   port_busy "$PANEL_PORT" && die "面板端口 $PANEL_PORT 已被占用"
 
   green "安装 3x-ui $XUI_VERSION ..."
-  curl -fLs -m 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o /tmp/xui-install.sh || die "下载 3x-ui 安装脚本失败"
+  setup=$(mktemp -d /run/relay-installer.XXXXXXXX)
+  curl -fLs -m 60 "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o "$setup/install.sh" || die "下载 3x-ui 安装脚本失败"
+  local ui_hash="${RELAY_XUI_INSTALL_SHA256:-}"
+  [[ -n "$ui_hash" || "$XUI_VERSION" != v3.11.0 ]] || ui_hash=9684bae4f769b2127fcceceb4f200045657381311867529e6ba76c6b58e2825d
+  [[ -n "$ui_hash" ]] || die "非默认面板版本需要提供 RELAY_XUI_INSTALL_SHA256"
+  verify_file "$setup/install.sh" "$ui_hash"
   XUI_NONINTERACTIVE=1 XUI_USERNAME="$user" XUI_PASSWORD="$pass" XUI_PANEL_PORT="$PANEL_PORT" \
     XUI_WEB_BASE_PATH="$WEB_PATH" XUI_SSL_MODE=none XUI_ENABLE_FAIL2BAN=false \
-    bash /tmp/xui-install.sh "$XUI_VERSION" </dev/null >/tmp/xui-install.log 2>&1 \
-    || { grep -vF -- "$pass" /tmp/xui-install.log > /tmp/xui-install.log.1; mv /tmp/xui-install.log.1 /tmp/xui-install.log
-         die "3x-ui 安装失败，日志：/tmp/xui-install.log"; }
-  # 官方安装日志会打印明文账号密码，成功后删掉
-  rm -f /tmp/xui-install.sh /tmp/xui-install.log /etc/x-ui/install-result.env
-  # 已装过的机器安装脚本会沿用旧设置，这里强制写一遍
+    bash "$setup/install.sh" "$XUI_VERSION" </dev/null >/dev/null 2>&1 \
+    || { retire_tmp "$setup"; die "3x-ui 安装器失败；上游输出含凭据，不记录"; }
+  retire_tmp "$setup" /etc/x-ui/install-result.env
+  # 明确新面板的管理监听地址。
   "$XUI_BIN" setting -username "$user" -password "$pass" -port "$PANEL_PORT" -webBasePath "$WEB_PATH" >/dev/null
+  "$XUI_BIN" setting -listenIP 127.0.0.1 >/dev/null
   unset pass pass2
   systemctl restart x-ui; wait_panel
   api_init
 
   install_xray
 
-  green "检查伪装网站 $SNI ..."
-  local scan; scan=$(api POST server/scanRealityTarget --data-urlencode "target=$SNI:443")
-  if [[ $(jget "$scan" obj.feasible) != True ]]; then
-    red "伪装网站不合格：$(jget "$scan" obj.reason)"
-    local go; ask go "仍然继续？[y/N]: " n; [[ "$go" == y ]] || die "已取消，换个伪装网站再来"
-  fi
+  # 不接受外部回落；本机站点已经通过 TLS 和内容校验。
+  self_test || die "出口校验失败；未创建或开放节点入站"
 
-  # 先测出口，用出口 IP 的国家地区给节点命名
-  local ok_exit=1
-  self_test || { ok_exit=0; yellow "（自检没过，配置照样建好，可以之后用「更换落地」重新设置）"; }
   if [[ -z "$NODE_NAME" ]]; then
-    [[ -n "${EXIT_IP:-}" ]] && NODE_NAME=$(region_name "$EXIT_IP")
+    [[ -z "${EXIT_IP:-}" ]] || NODE_NAME=$(region_name "$EXIT_IP" || true)
     NODE_NAME=${NODE_NAME:-节点}
   fi
   green "节点名称：$NODE_NAME"
 
+  install -d -m 700 "/etc/x-ui/relay-udp-identity/$SNI"
+  HY2_CRT="/etc/x-ui/relay-udp-identity/$SNI/node.crt"
+  HY2_KEY="/etc/x-ui/relay-udp-identity/$SNI/node.key"
   local r ip6 proto kind listen
   INBOUND_IDS=""; INBOUND_TAGS=""
-  ip6=$(local_ip6)
+  ip6=$(local_ip6 || true)
   for proto in vless hy2; do
     for kind in v4 v6; do
       if [[ $kind == v4 ]]; then listen=$(local_ip4); else listen=$ip6; [[ -n "$ip6" ]] || continue; fi
@@ -449,7 +526,8 @@ do_init() {
   echo; show_panel
   echo "节点链接（同时保存在 $LINKS）："; print_links
   yellow "每条链接是独立节点（密钥各不相同）。都导入客户端，哪条能用就用哪条。"
-  [[ $ok_exit == 1 ]] || red "注意：上面自检没通过，落地可能不可用。"
+  green "新机入站已创建，请从客户端验收每个地址族。"
+  panel_choice
 }
 
 # ---------- 2. 更换落地 ----------
@@ -464,6 +542,18 @@ do_landing() {
 }
 
 main() {
+  require_bundle
+  case "${1:-}" in
+    dns) shift; exec python3 "$RELAY_DIR/relay-dns.py" "$@" ;;
+    web) shift; need_root; exec python3 "$RELAY_DIR/relay-web.py" "$@" ;;
+    panel) shift; need_root; panel_choice; return ;;
+    panel-plan|panel-enable|panel-status|panel-disable)
+      local action="${1#panel-}"; shift; need_root; exec python3 "$RELAY_DIR/relay-panel.py" "$action" "$@" ;;
+    tcp-plan) shift; need_root; local arg; for arg in "$@"; do [[ "$arg" != --apply ]] || die "tcp-plan 不允许 --apply"; done; exec python3 "$RELAY_DIR/relay-tcp.py" "$@" ;;
+    tcp-apply) shift; need_root; exec python3 "$RELAY_DIR/relay-tcp.py" "$@" --apply ;;
+    udp-plan) shift; need_root; local arg; for arg in "$@"; do [[ "$arg" != --apply ]] || die "udp-plan 不允许 --apply"; done; exec python3 "$RELAY_DIR/relay-udp.py" "$@" ;;
+    udp-apply) shift; need_root; exec python3 "$RELAY_DIR/relay-udp.py" "$@" --apply ;;
+  esac
   need_root; ensure_deps
   case "${1:-}" in
     init) do_init; exit ;; landing) do_landing; exit ;; toggle) do_toggle; exit ;; links) print_links; exit ;;
@@ -473,7 +563,8 @@ main() {
   echo "2. 更换落地"
   echo "3. 开关入站（VLESS / HY2 × IPv4 / IPv6）"
   echo "4. 输出链接"
+  echo "5. 公网 HTTPS 管理面板（沿用面板账号）"
   local c; ask c "请选择: "
-  case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_toggle ;; 4) print_links ;; *) die "无效选择" ;; esac
+  case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_toggle ;; 4) print_links ;; 5) panel_choice ;; *) die "无效选择" ;; esac
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -1,42 +1,77 @@
-# relay：一键中转 / 落地
+# relay：节点安装与分阶段迁移
 
-登录服务器（root），粘贴：
+每台节点使用自己的子域名和证书，网页来自同一份 [site/index.html](site/index.html)。VLESS/REALITY 的未认证连接只能到本机 `127.0.0.1:8443`；新装 Hysteria2 时，未认证请求只收到本机 404。静态网页不含节点链接、外部资源或反向代理。
+
+**家宽落地是可选项。** 安装时在「落地出口」直接回车，默认走节点服务器自己的公网出口。双栈服务器即使没有家宽，也可以使用 TCP/VLESS 和 UDP/HY2 的 IPv4、IPv6 四条入站。以后有了家宽或其他指定出口，再在维护窗口执行 `bash relay.sh landing` 配置即可；不必重装节点。
+
+请使用**完整且同一版本的仓库目录**，不要只下载或执行单独的 `relay.sh`。可以直接把本地验收过的目录复制到新机器，或运行 `python3 tools/package.py` 生成含网页及公网面板工具的完整安装包（默认放在管理电脑的下载目录，仅包含清单列出的源码、测试和文档）。复制到新机后解压，在 `relay/` 目录运行。Git 发布版建议固定到已审核的提交或标签。下面的命令均在仓库目录中运行。
+
+## 新服务器
+
+1. 准备 Linux 服务器和专用子域名，每台用不同的名称。需要 systemd、Python 3、curl、OpenSSL、iproute2；当前实现面向 amd64/arm64。云安全组允许入站 TCP 80（签发和续期）、TCP 443 与 UDP 443（节点，可自选节点端口）。TCP 80 必须可供 HTTP-01 临时使用；**已有网站占用 80 时脚本会停止，不会接管它**。管理面板和本机 TCP 8443 不对外开放。
+2. 在**管理电脑**创建灰云 DNS。把下例变量换成本节点的信息；IPv4-only 机器省略 `--ipv6`，不要给它留旧的 AAAA。
+
+   ```bash
+   bash relay.sh dns --zone "$ZONE" --host "$NODE" --ipv4 "$PUBLIC_V4" --ipv6 "$PUBLIC_V6" --token-file "$CF_ENV"
+   # 核对预览后，给同一条命令加 --apply
+   ```
+
+   `CF_ENV` 是受保护的环境文件路径，工具只读取其中的 `CLOUDFLARE_API_TOKEN`。也可使用已有环境变量或手动添加 A/AAAA（仅 DNS）。工具不改其他主机名，不替换冲突记录，也不把 token 上传到节点。新机上直接执行 `init` 时若已有该环境变量，也可按提示创建 DNS。
+3. 在**空白节点**以 root 执行 `bash relay.sh init`。输入节点域名和面板信息，脚本会准备本机网页、申请证书、验证证书与页面、安装面板与核心并创建入站。在双栈节点生成 TCP IPv4、TCP IPv6、HY2 IPv4、HY2 IPv6；没有本地 IPv6 接口时只生成 IPv4 入站。**检测到已有 3x-ui 或数据库时，拒绝初始化。**
+4. 从客户端分别导入并实测要使用的线路。端口在监听、出口自检成功或网页能打开，都不能单独代替用有效节点凭据的端到端验收。节点链接包含实际凭据，勿提交到 Git、公开网页或工单。
+
+## 已有服务器：保留正在使用的 UDP，只换 TCP
+
+适用于本安装器管理的、启用了 Xray 本机 HandlerService API 的 VLESS/REALITY。不会重装面板，不改 UDP 入站，不重启共享的 Xray 或 x-ui。没有可用的热更新接口、没有找到对应标签、证书或本机页面不通过时会停止。旧 TCP 会逐条短暂断开。
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/woshizhangxiaohao/relay/main/relay.sh)
+bash relay.sh web "$NODE"        # 建/更新网页、证书和独立的续期任务
+bash relay.sh tcp-plan "$NODE"   # 临时在回环地址预演，不动现有入站
+bash relay.sh tcp-apply "$NODE"  # 备份后持久化配置并逐条热替换
 ```
 
-| 菜单 | 作用 |
+默认节点端口是 443；需要时给 TCP 子命令传 `--port`，NAT 节点可用 `--public-v4` 指定分享链接的公网地址。程序使用 SQLite 在线备份（含 WAL 中已提交的数据），保存原运行配置，仅更新 relay 管理的现有 TCP 标签；保留其身份凭据、端口、路由和落地。它同时检查 UDP 的数据库配置、进程和内核套接字是否保持不变。备份在 root 专用的 `/root/relay-tcp-backup-时间戳/`。
+
+新 TCP 链接在 `/etc/x-ui/relay-tcp-links.txt`（权限 600，每行一条），导入名称为 `节点域名-TCP-VLESS-IPv4` 和 `节点域名-TCP-VLESS-IPv6`。链接最后的名称只是客户端备注，不参与连接。现有综合导出文件仅替换匹配到的 TCP 链接。先把新 TCP 添加为独立节点，在实际常用设备、网络上试用；**确认能切到 TCP 之后，再另行安排旧 UDP 的迁移。不要用 `init` 或全局重启来完成分阶段切换。** 如某个 TCP 标签热替换失败，保留用户正在用的 UDP，先核对该标签，勿自动恢复向第三方网站转发的旧配置。
+
+## 已切换到 TCP：用新 UDP 替下旧 UDP
+
+先在日常设备上切到已验收的 TCP 节点，保持它连接。迁移只接管本脚本管理的 HY2 入站，不重启共享的 x-ui 或 Xray。沿用原来的端口、面板账户、流量记录和路由；使用本机新域名的独立固定指纹证书、每条各自的新传输口令。旧 UDP 链接因此失效，未认证的请求只返回本机 404，不访问第三方。
+
+```bash
+bash relay.sh udp-plan "$NODE"
+bash relay.sh udp-apply "$NODE" --family 6  # 先测新 IPv6 节点
+bash relay.sh udp-apply "$NODE" --family 4  # IPv6 测通后再换 IPv4
+```
+
+只有 IPv4 的节点只执行 `--family 4`；NAT 服务器可传 `--public-v4`。预演使用回环上的独立测试实例。实际切换前会做 SQLite 在线备份，运行中逐条检查 Xray 的 404 配置、另一条 UDP 的套接字和同一条已建立的 TCP 连接。相同配置重复执行不会轮换口令或替换正在使用的监听。每次从 `/etc/x-ui/relay-udp-links.txt` 取已完成的链接（权限 600），在外部客户端验证；两条都通过后再从手机删除旧条目。若某一条未热加载成功，继续使用 TCP，核对输出中的备份路径，不要重启共享核心或恢复第三方回落。
+
+## 网页、证书与续期
+
+- 网页只维护 `site/index.html`；每台服务器保存本地副本。要更新页面，在该机重新运行 `bash relay.sh web "$NODE"`。普通访问者看到「服务在线。」；节点使用者的认证信息永远不在页面里。
+- 独立的 Caddy 只监听回环 TCP 8443，不监听 UDP，不反向代理。systemd 对该进程限制公网出站。新机的 REALITY 始终使用这个固定的回环目标；证书的域名、服务端名称和 TCP 客户端的 SNI 一致。
+- Let’s Encrypt 通过 TCP 80 的 HTTP-01 验证，不需要把 Cloudflare DNS 凭据放在服务器。续期由 `relay-local-cert-renew.timer` 负责，仅在换证时重启静态网页服务；不会重启 Xray 或面板。独立的证书状态和私钥在 `/var/lib/relay-local-cert/`（仅 root 可读）。查看定时器：`systemctl list-timers relay-local-cert-renew.timer`。
+- 新机 HY2 使用独立的自签证书，并在客户端固定 SHA-256 指纹，避免网页证书续期导致 HY2 指纹变化。**更新网页或现有 TCP 不会替换老 HY2 的证书。**
+
+## 其他命令
+
+### 浏览器直接访问管理面板（可选）
+
+新机初始化的最后会询问「公网 HTTPS 管理面板」；已有节点用 `bash relay.sh panel` 或菜单 5，不必重装。选「公网 HTTPS，用原面板登录」，之后在任意设备打开 **`https://节点域名:9443/`**，会自动跳到这台机器实际的登录路径。每台服务器沿用自己的面板账号和密码；脚本不会创建第二套账号，也不会收集或复制面板密码。已在面板设置里绑定动态验证码的账号，照常使用验证码。
+
+| 命令（在节点上执行） | 用途 |
 |---|---|
-| 1. 初始化 | 安装 3x-ui v3.11.0 + Xray v26.6.27，建好 4 个入站（VLESS+Reality、Hysteria2 × IPv4、IPv6）、落地出站和转发规则，输出节点链接 |
-| 2. 更换落地 | 换 SOCKS5 / 落地机链接，或改成不需要落地；节点链接不变 |
-| 3. 开关入站 | 4 个入站任意开关一个（面板里点开关效果相同） |
-| 4. 输出链接 | 读当前配置重新打印链接，不改任何东西（非本脚本装的 3x-ui 也能用） |
+| `bash relay.sh panel-plan --login` | 只在回环地址预演：验证证书、登录页、未登录保护，不开放公网 |
+| `bash relay.sh panel-enable --login` | 允许任意网络到达 HTTPS 登录页；仍需原面板账号密码 |
+| `bash relay.sh panel-enable --allow-ip "$ADMIN_IP"` | 固定来源模式，只让指定的公网 IPv4/IPv6 到达登录页；可重复提供 IP |
+| `bash relay.sh panel-status` / `bash relay.sh panel-disable` | 查看或关闭本机的公网入口；不影响节点及本机面板 |
 
-也可以直接带子命令：`relay.sh init | landing | toggle | links`。
+默认不开放，端口可用 `--port` 指定。若有主机防火墙或云厂商安全组，另行按选定来源放行**面板的 TCP 端口**；不要开放后端和静态页的端口。公网入口是独立的 Caddy 服务，只将面板路径代理给回环上的 3x-ui；入口供浏览器登录使用，会去掉传入的 Authorization、X-API-Key 和 X-API-Token 请求头。它复用本节点证书，随静态服务的换证重启重新读取证书；不重启 x-ui 或 Xray。不同节点无需共用管理账号或密码。
 
-## 默认值
+| 命令 | 用途 |
+|---|---|
+| `bash relay.sh links` | 输出已启用的节点链接，并刷新仅 root 可读的综合文件 |
+| `bash relay.sh landing` | 更换 SOCKS5 / VLESS 落地，或改为直连 |
+| `bash relay.sh toggle` | 开关入站；拒绝重新启用仍有外部回落的旧入站 |
 
-- 面板端口 8888，访问路径 `/zxh/`，账号密码运行时输入（脚本不保存）
-- 入站端口 443，伪装网站 `calmerry.com`（初始化时会检查 TLS 1.3 + HTTP/2）
-- 版本可用环境变量改：`RELAY_XUI_VERSION=v3.11.0`、`RELAY_XRAY_VERSION=v26.6.27`
-
-## 规则
-
-- 初始化建 4 个入站：VLESS+Reality（TCP）和 Hysteria2（UDP）各 IPv4、IPv6 一个，同一端口（默认 443），各用独立密钥，互相不能关联；本机没有公网 IPv6 时只建 IPv4 的两个。全部转发到同一个落地。
-- Hysteria2：自签证书 + 客户端固定证书指纹（pinSHA256，不用 insecure）、salamander 混淆、伪装成伪装网站、只用 TLS 1.3。证书在 `/etc/x-ui/relay-hy2.crt`。
-- 节点名默认按出口 IP 的国家地区自动生成（如 `美国加州-HY2-v4`），初始化时可改。
-- 出口只用 IPv4（direct 出站 `UseIPv4`），网站看到的永远是本机或落地的 IPv4。
-- 有落地时，本入站的流量全部走落地；落地不通就连不上，不会改用本机 IP 出去。
-- 「不需要落地」的机器输出的 IPv4 链接，可以直接粘贴给另一台中转机当落地。
-- 初始化在已装 3x-ui 的机器上会先把 `/etc/x-ui` 和 `/usr/local/x-ui` 打包备份到 `/root/relay-backup-时间.tar.gz`，再清空重建。
-
-## 落地格式
-
-- SOCKS5：`IP|端口|账号|密码|到期`、`IP:端口:账号:密码` 或 `socks5://账号:密码@IP:端口`
-- 自己的落地机：那台机器「输出链接」得到的 `vless://` 链接
-
-## 本机文件
-
-- `/etc/x-ui/relay.env`：脚本记录的入站 ID、端口、落地类型等（不含密码）
-- `/etc/x-ui/relay-links.txt`：最近一次输出的节点链接（仅 root 可读）
+`landing` 和 `toggle` 仍可能重启共享内核，需要维护窗口；不是保留当前连接的迁移命令。3x-ui 后端默认仅监听 `127.0.0.1:8888`；公网管理使用上面独立的 HTTPS 入口。新机安装固定 3x-ui v3.11.0、Xray v26.6.27，下载校验的版本与摘要在脚本中；覆盖版本时必须提供对应的受信任摘要。
