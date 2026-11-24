@@ -46,6 +46,33 @@ bash relay.sh udp-apply "$NODE" --family 4  # IPv6 测通后再换 IPv4
 
 只有 IPv4 的节点只执行 `--family 4`；NAT 服务器可传 `--public-v4`。预演使用回环上的独立测试实例。实际切换前会做 SQLite 在线备份，运行中逐条检查 Xray 的 404 配置、另一条 UDP 的套接字和同一条已建立的 TCP 连接。相同配置重复执行不会轮换口令或替换正在使用的监听。每次从 `/etc/x-ui/relay-udp-links.txt` 取已完成的链接（权限 600），在外部客户端验证；两条都通过后再从手机删除旧条目。若某一条未热加载成功，继续使用 TCP，核对输出中的备份路径，不要重启共享核心或恢复第三方回落。
 
+## 导出 Clash / Mihomo：大陆直连，其他走代理
+
+支持 **Clash Verge Rev、Mihomo Party 和其他使用 Mihomo / Clash.Meta 内核的客户端**。旧版 Clash 内核不支持这套 REALITY / HY2 节点。导出器只读取本地分享链接，不改变服务端、系统代理或正在使用的客户端；无需在线订阅转换。
+
+在节点上运行 `bash relay.sh clash`（菜单 6）。默认读取 `/etc/x-ui/relay-links.txt`，把私有配置写到 `/etc/x-ui/relay-clash.yaml`。如果刚在面板里改过节点，先刷新本地分享链接；已有两份独立的 TCP、UDP 导出时，也可以在管理电脑执行：
+
+```bash
+bash relay.sh clash \
+  --links "$HOME/Downloads/TCP节点.txt" \
+  --links "$HOME/Downloads/UDP节点.txt" \
+  --output "$HOME/Downloads/我的节点-Clash.yaml"
+```
+
+替换为自己的文件名。在客户端选**导入本地配置文件**，启用该配置并选 **规则（Rule）模式**。「节点选择」里可以切换四条线路，首次默认 TCP/VLESS IPv4，之后会记住所选节点；只有 IPv4 的服务器也能按实际节点导出。配置默认只在本机提供代理端口 7890，可用 `--mixed-port` 更改。不要同时让多个客户端接管系统代理或 TUN。
+
+| 访问目的地 | 走哪里 |
+|---|---|
+| 本机、局域网、`.cn` 及大陆域名规则命中 | 直连（DIRECT） |
+| 目的 IPv4 或 IPv6 命中大陆 IP 网段 | 直连（DIRECT）；未被域名表收录的域名也可以解析后按 IP 判断 |
+| 其余目的地 | 走「节点选择」当前选中的节点 |
+
+默认在**生成时**从 [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) 的同一提交读取大陆域名和 IPv4/IPv6 网段，直接内置进一个 YAML。导入时不需要再下载规则；要更新快照，重新导出即可。大陆域名优先用国内 DNS，其余默认使用经所选节点的加密 DNS。VLESS 保留 Vision、REALITY 公钥和 short-id；HY2 保留认证、传输口令和证书 SHA-256 指纹，不关闭证书校验。
+
+- 想要小文件并自动更新：导出时加 `--rules online`。Mihomo 会通过所选节点获取两个 MRS 规则集并定期更新；首次加载需要节点能够连接规则源。
+- 无法在导出设备访问 GitHub：将上游同一版本的 `geo/geosite/cn.list`、`geo/geoip/cn.list` 分别保存为 `geosite-cn.list`、`geoip-cn.list`，用 `--rules-dir 本地目录` 生成离线配置。自动下载时也可用 `--rule-ref 完整提交号` 固定版本。
+- **YAML 本身就是节点凭据**，文件权限为 600，不要放在公共网站或仓库。重复运行不会覆盖不同内容；明确使用 `--replace` 才会先做私有备份再替换。安装包只包含通用导出器和合成测试，不包含任何人的节点配置。
+
 ## 网页、证书与续期
 
 - 网页只维护 `site/index.html`；每台服务器保存本地副本。要更新页面，在该机重新运行 `bash relay.sh web "$NODE"`。普通访问者看到「服务在线。」；节点使用者的认证信息永远不在页面里。

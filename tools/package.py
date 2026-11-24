@@ -10,8 +10,8 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 FILES=("README.md","relay.sh","relay-dns.py","relay-web.py","relay-tcp.py","relay-udp.py",
-       "relay-panel.py","relay_hot.py","site/index.html","tests/check-templates.py",
-       "tests/check-udp-migration.py","tools/package.py")
+       "relay-panel.py","relay-clash.py","relay_hot.py","site/index.html","tests/check-templates.py",
+       "tests/check-udp-migration.py","tests/check-clash.py","tools/package.py")
 
 def package(dest):
     dst=Path(dest).expanduser();dst.mkdir(parents=True,exist_ok=True)

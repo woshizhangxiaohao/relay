@@ -26,7 +26,7 @@ ask() { local __v="$1" __p="$2" __d="${3:-}" __a; read -r -p "$__p" __a </dev/tt
 # 同一个版本的脚本、网页与迁移工具须成套使用。
 require_bundle() {
   local x
-  for x in relay-web.py relay-dns.py relay-tcp.py relay-udp.py relay-panel.py relay_hot.py site/index.html; do
+  for x in relay-web.py relay-dns.py relay-tcp.py relay-udp.py relay-panel.py relay-clash.py relay_hot.py site/index.html; do
     [[ -f "$RELAY_DIR/$x" ]] || die "需要完整的 relay 目录（缺少 $x），请按 README 下载同一版本。"
   done
 }
@@ -544,6 +544,7 @@ do_landing() {
 main() {
   require_bundle
   case "${1:-}" in
+    clash) shift; exec python3 "$RELAY_DIR/relay-clash.py" "$@" ;;
     dns) shift; exec python3 "$RELAY_DIR/relay-dns.py" "$@" ;;
     web) shift; need_root; exec python3 "$RELAY_DIR/relay-web.py" "$@" ;;
     panel) shift; need_root; panel_choice; return ;;
@@ -564,7 +565,8 @@ main() {
   echo "3. 开关入站（VLESS / HY2 × IPv4 / IPv6）"
   echo "4. 输出链接"
   echo "5. 公网 HTTPS 管理面板（沿用面板账号）"
+  echo "6. 导出 Clash/Mihomo 配置（大陆直连，其他走代理）"
   local c; ask c "请选择: "
-  case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_toggle ;; 4) print_links ;; 5) panel_choice ;; *) die "无效选择" ;; esac
+  case "$c" in 1) do_init ;; 2) do_landing ;; 3) do_toggle ;; 4) print_links ;; 5) panel_choice ;; 6) python3 "$RELAY_DIR/relay-clash.py" ;; *) die "无效选择" ;; esac
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
